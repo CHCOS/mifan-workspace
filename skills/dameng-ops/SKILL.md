@@ -1,0 +1,205 @@
+---
+name: dameng-ops
+description: 达梦数据库巡检、运维与优化。当用户提到达梦数据库、DM8、达梦运维、达梦巡检、达梦性能优化、达梦备份恢复、达梦DMHS、达梦读写分离、达梦集群DMDSC、达梦监视器、达梦参数调优、国产数据库运维、信创数据库时使用。
+---
+
+# 达梦数据库（DM8）运维
+
+## 前置准备
+```bash
+# 环境变量
+export DM_HOME=/opt/dm8
+export PATH=$DM_HOME/bin:$PATH
+# 连接
+disql SYSDBA/SYSDBA@localhost:5236
+# 版本
+SELECT * FROM V$VERSION;
+```
+
+## 巡检 SQL（SYSDBA执行）
+
+### 1. 实例基础信息
+```sql
+-- 版本与状态
+SELECT * FROM V$VERSION;
+SELECT SF_GET_PARA_VALUE(2,'PORT_NUM') PORT;
+SELECT SF_GET_PARA_VALUE(2,'INSTANCE_NAME') INST_NAME;
+SELECT STATUS$ FROM V$INSTANCE;
+-- 授权信息
+SELECT * FROM V$LICENSE ORDER BY EXPIRED_DATE;
+```
+
+### 2. 表空间使用
+```sql
+SELECT t.NAME TABLESPACE_NAME,
+       d.PATH FILE_PATH,
+       ROUND(d.TOTAL_SIZE*SF_GET_PAGE_SIZE()/1024/1024/1024, 2) TOTAL_GB,
+       ROUND(d.FREE_SIZE*SF_GET_PAGE_SIZE()/1024/1024/1024, 2) FREE_GB,
+       ROUND((1-d.FREE_SIZE/d.TOTAL_SIZE)*100, 2) USED_PCT
+FROM V$TABLESPACE t, V$DATAFILE d
+WHERE t.ID = d.GROUP_ID
+ORDER BY USED_PCT DESC;
+
+-- 临时表空间
+SELECT t.NAME, ROUND(d.TOTAL_SIZE*SF_GET_PAGE_SIZE()/1024/1024,2) TOTAL_MB,
+       ROUND(d.FREE_SIZE*SF_GET_PAGE_SIZE()/1024/1024,2) FREE_MB
+FROM V$TABLESPACE t, V$ROLLFILE d WHERE t.ID = d.GROUP_ID;
+```
+
+### 3. 会话与锁
+```sql
+-- 活动会话
+SELECT SESS_ID, SQL_TEXT, STATE, CLNT_IP, CREATE_TIME, CLNT_APP
+FROM V$SESSIONS WHERE STATE='ACTIVE' ORDER BY CREATE_TIME;
+-- 会话统计
+SELECT STATE, COUNT(*) FROM V$SESSIONS GROUP BY STATE;
+-- 锁等待
+SELECT w.SESS_ID waiting_sess, w.WAIT_TIME, w.TABLE_ID,
+       s1.SQL_TEXT waiting_sql, s2.SQL_TEXT blocking_sql, s2.SESS_ID blocking_sess
+FROM V$LOCK_WAIT w
+LEFT JOIN V$SESSIONS s1 ON w.SESS_ID=s1.SESS_ID
+LEFT JOIN V$SESSIONS s2 ON w.WAIT_FOR_ID=s2.TRX_ID;
+-- 死锁
+SELECT * FROM V$DEADLOCK_HISTORY;
+SELECT * FROM V$TRXWAIT;
+-- 长事务
+SELECT TRX_ID, SESS_ID, STATE, ISOLATION_LEVEL,
+       TIMESTAMPDIFF(SS, START_TIME, SYSDATE) DURATION_SEC
+FROM V$TRXIDLE WHERE TIMESTAMPDIFF(SS, START_TIME, SYSDATE) > 300;
+```
+
+### 4. 性能指标
+```sql
+-- 缓冲区命中率
+SELECT ROUND((1-SUM(MISS)/SUM(GETS))*100, 2) BUFFER_HIT
+FROM V$BUFFERPOOL;
+-- SQL命中率
+SELECT ROUND((1-SUM(MISSES)/SUM(GETS))*100, 2) SQL_HIT
+FROM V$SQL_STAT;
+-- 字典缓存
+SELECT ROUND((1-SUM(MISS)/SUM(GETS))*100, 2) DICT_HIT
+FROM V$DICT_CACHE;
+-- Top SQL（按执行时间）
+SELECT TOP 20 SQL_TEXT, EXEC_TIME, EXEC_CNT, DISK_READS, BUFFER_GETS, ROWS
+FROM V$SQL_STAT ORDER BY EXE_TIME DESC;
+-- Top SQL（按逻辑读）
+SELECT TOP 20 SQL_TEXT, BUFFER_GETS, EXEC_CNT, EXE_TIME FROM V$SQL_STAT ORDER BY BUFFER_GETS DESC;
+```
+
+### 5. 存储与文件
+```sql
+-- 数据文件
+SELECT FILE_ID, GROUP_ID, PATH, TOTAL_SIZE, FREE_SIZE, AUTO_EXTEND
+FROM V$DATAFILE ORDER BY GROUP_ID;
+-- 回滚段
+SELECT TRX_ID, XID, STATE, URSP FROM V$ROLLABCK;
+-- 归档状态
+SELECT ARCH_NAME, ARCH_TYPE, ARCH_DEST, ARCH_FILE_SIZE
+FROM V$DM_ARCH_INI WHERE ARCH_TYPE='LOCAL' OR ARCH_TYPE='REALTIME';
+-- 归档日志空间
+SELECT ARCH_PATH, ROUND(SUM(FILE_SIZE)/1024/1024/1024,2) TOTAL_GB FROM V$ARCH_FILE;
+```
+
+### 6. DSC集群状态（如配置DSC）
+```sql
+SELECT * FROM V$DSC_EP_INFO;
+SELECT * FROM V$DSC_TRAFFIC_STAT;
+SELECT * FROM V$DSC_EP_STATUS;
+-- 控制文件
+SELECT PARA_NAME, PARA_VALUE FROM V$DM_INI WHERE PARA_NAME LIKE '%DSC%';
+```
+
+### 7. 作业/定时任务
+```sql
+SELECT JOB_NAME, ENABLE, LAST_RUN, NEXT_RUN, RUN_COUNT, FAIL_COUNT
+FROM V$DBMS_JOB ORDER BY JOB_NAME;
+```
+
+### 8. 备份检查
+```sql
+SELECT BACKUP_ID, BACKUP_NAME, BACKUP_PATH, TYPE, LEVEL, BEGIN_TIME, END_TIME,
+       DATEDIFF(SS, BEGIN_TIME, END_TIME) DURATION_SEC, SIZE_MB
+FROM V$BACKUPSET ORDER BY BEGIN_TIME DESC LIMIT 10;
+-- 备份策略
+SELECT * FROM V$BACKUPSET_SEARCH_DIRS;
+```
+
+## 常见运维操作
+
+### 表空间扩容
+```sql
+ALTER TABLESPACE MAIN ADD DATAFILE '/dmdata/main02.dbf' SIZE 1024 AUTOEXTEND ON MAXSIZE 30720;
+ALTER TABLESPACE MAIN RESIZE DATAFILE '/dmdata/main01.dbf' TO 10240;
+```
+
+### 参数调优
+```sql
+-- 关键参数
+SELECT PARA_NAME, PARA_VALUE, DEFAULT_VALUE
+FROM V$DM_INI WHERE PARA_NAME IN (
+    'MEMORY_POOL','BUFFER','MAX_SESSIONS','SORT_BUF_SIZE',
+    'HUGE_MEMORY_TARGET','TASK_THREADS','WORKER_THREADS',
+    'IO_THR_GROUPS','ENABLE_MONITOR','MONITOR_TIME','SVR_NET_TIMEOUT'
+);
+-- 修改参数
+CALL SP_SET_PARA_VALUE(2, 'BUFFER', 1024);  -- 重启生效
+CALL SP_SET_PARA_VALUE(1, 'MAX_SESSIONS', 2000);  -- 即时生效
+```
+
+### 备份恢复
+```bash
+# 全量备份（联机）
+dmbackup /home/dm8/backup/full -p SYSDBA
+# 增量备份
+dmbackup /home/dm8/backup/incr -p SYSDBA -T INCREMENT WITH BACKUPDIR /home/dm8/backup/full
+# 恢复
+dmrestore /home/dm8/backup/full/full.bak -p SYSDBA
+# DMRMAN工具
+RMAN> BACKUP DATABASE '/dmdata/dm.ini' FULL TO "full_bak" BACKUPSET '/dmdata/backup/full';
+RMAN> BACKUP DATABASE '/dmdata/dm.ini' INCREMENT WITH BACKUPDIR '/dmdata/backup/full' TO "incr_bak" BACKUPSET '/dmdata/backup/incr';
+```
+
+### 用户与权限
+```sql
+-- 密码策略
+SELECT SF_GET_PARA_VALUE(2,'PWD_POLICY');
+-- 锁定用户
+ALTER USER appuser ACCOUNT LOCK;
+-- 解锁
+ALTER USER appuser ACCOUNT UNLOCK;
+-- 修改密码
+ALTER USER appuser IDENTIFIED BY "NewPass123!";
+```
+
+### 统计信息收集
+```sql
+-- 手动收集
+DBMS_STATS.GATHER_TABLE_STATS('SCHEMA','TABLE_NAME',NULL,100);
+-- 全库
+BEGIN
+  DBMS_STATS.GATHER_SCHEMA_STATS('SCHEMA',100,TRUE);
+END;
+/
+```
+
+## 巡检报告模板
+
+```markdown
+# 达梦数据库巡检报告
+**实例:** xxx | **版本:** DM8.x | **端口:** 5236 | **运行时间:** xx天
+
+## 资源使用
+| 指标 | 值 | 阈值 | 状态 |
+|------|-----|------|------|
+| 表空间使用率(最高) | | < 85% | ✅/⚠️ |
+| 缓冲区命中率 | | > 95% | ✅/⚠️ |
+| SQL缓存命中率 | | > 90% | ✅/⚠️ |
+| 活动会话数 | | - | |
+| 锁等待 | | 0 | ✅/⚠️ |
+| 失败作业数 | | 0 | ✅/⚠️ |
+
+## 备份状态
+## 归档状态
+## 授权信息
+## 异常与建议
+```
